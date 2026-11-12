@@ -108,8 +108,19 @@ S = 2
 W, H = 1080 * S, 1920 * S
 
 
+def buscar(parte, ext):
+    """Encuentra un archivo por parte del nombre, en assets/fonts, assets o la carpeta principal."""
+    for base in (os.path.join(AQUI, "assets", "fonts"), os.path.join(AQUI, "assets"), AQUI):
+        if os.path.isdir(base):
+            for f in sorted(os.listdir(base)):
+                if parte.lower() in f.lower() and f.lower().endswith(ext):
+                    return os.path.join(base, f)
+    raise FileNotFoundError(f"No encuentro un archivo '*{parte}*{ext}'. Archivos en el repositorio: "
+                            f"{sorted(os.listdir(AQUI))}")
+
+
 def font(peso, tam):
-    return ImageFont.truetype(os.path.join(AQUI, "assets", "fonts", f"Poppins-{peso}.ttf"), int(tam * S))
+    return ImageFont.truetype(buscar(f"Poppins-{peso}", ".ttf"), int(tam * S))
 
 
 def dibujar(datos, salida):
@@ -123,7 +134,7 @@ def dibujar(datos, salida):
             arr[:, :, k] = np.where(m, c0[k] + (c1[k] - c0[k]) * t, arr[:, :, k])
     bg = Image.fromarray(np.repeat(arr, W, axis=1).astype("uint8")).convert("RGBA")
 
-    logo = Image.open(os.path.join(AQUI, "assets", "logo.png")).convert("RGBA")
+    logo = Image.open(buscar("logo", ".png")).convert("RGBA")
     a = np.array(logo).astype(float)
     mask = ((255 - a[..., :3].mean(axis=2)) / 255 * a[..., 3]).clip(0, 255).astype("uint8")
     blanco = Image.new("RGBA", logo.size, (255, 255, 255, 255))

@@ -1,0 +1,47 @@
+name: Placa diaria del tiempo
+
+on:
+  schedule:
+    - cron: "30 10 * * *"        # 10:30 UTC = 07:30 hora de Argentina
+  workflow_dispatch:
+    inputs:
+      solo_probar:
+        description: "Generar la placa pero NO publicarla en Instagram"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  placa:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Generar la placa
+        env:
+          OPEN_METEO_API_KEY: ${{ secrets.OPEN_METEO_API_KEY }}
+        run: python generar_placa.py
+
+      - name: Guardar la placa en el repositorio
+        run: |
+          git config user.name "placa-bot"
+          git config user.email "placa-bot@users.noreply.github.com"
+          git add placas
+          git commit -m "Placa del día" || echo "Sin cambios"
+          git push
+
+      - name: Publicar en Instagram
+        if: ${{ github.event_name == 'schedule' || inputs.solo_probar == false }}
+        env:
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+        run: python publicar.py

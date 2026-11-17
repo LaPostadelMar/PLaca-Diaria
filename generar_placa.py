@@ -21,37 +21,70 @@ PUNTOS = ["N", "NE", "E", "SE", "S", "SO", "O", "NO"]
 
 
 # ---------------------------------------------------------------- datos
-def open_meteo(host, ruta, params):
+def open_meteo(host, ruta, params, intentos=3):
     prefijo = "customer-" if API_KEY else ""
     if API_KEY:
         params["apikey"] = API_KEY
-    for intento in range(3):
+    for intento in range(intentos):
         try:
-            r = requests.get(f"https://{prefijo}{host}.open-meteo.com{ruta}", params=params, timeout=30)
+            r = requests.get(f"https://{prefijo}{host}.open-meteo.com{ruta}", params=params, timeout=(10, 25))
             r.raise_for_status()
             return r.json()
         except Exception:
-            if intento == 2:
+            if intento == intentos - 1:
                 raise
-            time.sleep(5)
+            time.sleep(10 * (intento + 1))
 
 
-def clima(hoy):
+def resumen_clima(temps, vel, ang, fuente):
+    u = sum(v * math.sin(a) for v, a in zip(vel, ang))
+    w = sum(v * math.cos(a) for v, a in zip(vel, ang))
+    grados = math.degrees(math.atan2(u, w)) % 360
+    return {"tmax": max(temps), "tmin": min(temps), "viento_kmh": sum(vel) / len(vel),
+            "viento_dir": PUNTOS[round(grados / 45) % 8], "fuente": fuente}
+
+
+def clima_open_meteo(hoy):
     j = open_meteo("api", "/v1/forecast", {
         "latitude": LAT, "longitude": LON, "timezone": TZ_NOMBRE,
         "hourly": "temperature_2m,wind_speed_10m,wind_direction_10m",
         "wind_speed_unit": "kmh", "start_date": hoy.isoformat(), "end_date": hoy.isoformat()})
     h = j["hourly"]
     horas = [dt.datetime.fromisoformat(t) for t in h["time"]]
-    tmax, tmin = max(h["temperature_2m"]), min(h["temperature_2m"])
     dia = [i for i, t in enumerate(horas) if 10 <= t.hour <= 19]      # horario de playa
     vel = [h["wind_speed_10m"][i] for i in dia]
     ang = [math.radians(h["wind_direction_10m"][i]) for i in dia]
-    u = sum(v * math.sin(a) for v, a in zip(vel, ang))
-    w = sum(v * math.cos(a) for v, a in zip(vel, ang))
-    grados = math.degrees(math.atan2(u, w)) % 360
-    return {"tmax": tmax, "tmin": tmin, "viento_kmh": sum(vel) / len(vel),
-            "viento_dir": PUNTOS[round(grados / 45) % 8]}
+    return resumen_clima(h["temperature_2m"], vel, ang, "Open-Meteo")
+
+
+def clima_metno(hoy):
+    """Plan B: servicio meteorológico de Noruega (MET Norway), gratuito y sin clave."""
+    r = requests.get("https://api.met.no/weatherapi/locationforecast/2.0/compact",
+                     params={"lat": round(LAT, 4), "lon": round(LON, 4)},
+                     headers={"User-Agent": "LaPostaDelMar-placa-diaria/1.0 github.com/LaPostadelMar/PLaca-Diaria"},
+                     timeout=(10, 30))
+    r.raise_for_status()
+    temps, vel, ang = [], [], []
+    for e in r.json()["properties"]["timeseries"]:
+        t = dt.datetime.fromisoformat(e["time"].replace("Z", "+00:00")).astimezone(TZ)
+        if t.date() != hoy:
+            continue
+        det = e["data"]["instant"]["details"]
+        temps.append(det["air_temperature"])
+        if 10 <= t.hour <= 19:
+            vel.append(det["wind_speed"] * 3.6)                          # m/s -> km/h
+            ang.append(math.radians(det["wind_from_direction"]))
+    if not temps or not vel:
+        raise RuntimeError("MET Norway no devolvió datos para hoy")
+    return resumen_clima(temps, vel, ang, "MET Norway")
+
+
+def clima(hoy):
+    try:
+        return clima_open_meteo(hoy)
+    except Exception as e:
+        print(f"Aviso: Open-Meteo no respondió ({type(e).__name__}). Pruebo con MET Norway...")
+        return clima_metno(hoy)
 
 
 def extremos(tiempos, alturas):
@@ -76,7 +109,7 @@ def extremos(tiempos, alturas):
 def mareas(hoy):
     j = open_meteo("marine-api", "/v1/marine", {
         "latitude": MAR_LAT, "longitude": MAR_LON, "timezone": TZ_NOMBRE,
-        "hourly": "sea_level_height_msl", "past_days": 1, "forecast_days": 2})
+        "hourly": "sea_level_height_msl", "past_days": 1, "forecast_days": 2}, intentos=2)
     t = [dt.datetime.fromisoformat(x) for x in j["hourly"]["time"]]
     v = j["hourly"]["sea_level_height_msl"]
     ex = [(m, tipo) for m, tipo in extremos(t, v) if m.date() == hoy]
@@ -218,6 +251,9 @@ def dibujar(datos, salida):
             txt = datos[tipo]
             d.text((tx, (y + 68) * S), txt, font=ajustada(txt, "Bold", 70), fill=blanco)
 
+    if datos.get("fuentes"):
+        centrado("Datos: " + " · ".join(datos["fuentes"]), 1636, font("Medium", 22), (255, 255, 255, 170))
+
     bg.convert("RGB").resize((W // S, H // S), Image.LANCZOS).save(salida, "JPEG", quality=95)
 
 
@@ -234,7 +270,7 @@ def main():
     hoy = dt.date.fromisoformat(args.fecha) if args.fecha else dt.datetime.now(TZ).date()
 
     if args.demo:
-        c = {"tmax": 27.2, "tmin": 17.4, "viento_kmh": 18.3, "viento_dir": "SO"}
+        c = {"tmax": 27.2, "tmin": 17.4, "viento_kmh": 18.3, "viento_dir": "SO", "fuente": "Open-Meteo"}
         m = {"pleamar": "04:12 · 16:35", "bajamar": "10:20 · 22:41"}
         salida = os.path.join(AQUI, "placa-demo.jpg")
     else:
@@ -261,6 +297,7 @@ def main():
         "viento": f"{c['viento_dir']} {c['viento_kmh']:.0f} km/h",
         "mareas": m,
         "sol": puesta_de_sol(hoy).strftime("%H:%M") + " hs",
+        "fuentes": sorted({c["fuente"]} | ({"Open-Meteo"} if m else set())),
     }
     dibujar(datos, salida)
     print("Placa generada:", salida, datos)

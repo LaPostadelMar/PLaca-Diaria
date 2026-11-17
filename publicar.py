@@ -1,19 +1,15 @@
 #!/usr/bin/env python3
-"""Publica la placa de hoy como historia de Instagram (API oficial de Meta)."""
+"""Publica la placa de hoy como historia de Instagram (API oficial de Meta).
+
+Reconoce solo dos tipos de token:
+  - empieza con "IG": token de Instagram  -> graph.instagram.com
+  - cualquier otro (ej. "EAA"): token de Facebook -> graph.facebook.com
+"""
 import os, sys, time, datetime as dt
 from zoneinfo import ZoneInfo
 import requests
 
 VERSION = "v26.0"                                   # versión de la API de Meta
-BASE = f"https://graph.instagram.com/{VERSION}"
-TOKEN = os.environ["IG_ACCESS_TOKEN"]
-USER_ID = os.environ.get("IG_USER_ID", "").strip() or "me"
-HEAD = {"Authorization": f"Bearer {TOKEN}"}
-
-hoy = dt.datetime.now(ZoneInfo("America/Argentina/Buenos_Aires")).date()
-repo = os.environ["GITHUB_REPOSITORY"]
-rama = os.environ.get("GITHUB_REF_NAME", "main")
-url = f"https://raw.githubusercontent.com/{repo}/{rama}/placas/placa-{hoy.isoformat()}.jpg"
 
 
 def fallar(msg, r=None):
@@ -22,6 +18,50 @@ def fallar(msg, r=None):
         print("Respuesta de Instagram:", r.status_code, r.text[:800])
     sys.exit(1)
 
+
+# El token se limpia por si se pegó con espacios, saltos de línea o comillas de más
+TOKEN = os.environ.get("IG_ACCESS_TOKEN", "").strip().strip("\"'").strip()
+if TOKEN.lower().startswith("bearer "):
+    TOKEN = TOKEN[7:]
+TOKEN = "".join(TOKEN.split())
+print(f"Diagnóstico del token: {len(TOKEN)} caracteres, empieza con '{TOKEN[:4]}'")
+if not TOKEN:
+    fallar("El secreto IG_ACCESS_TOKEN está vacío o no existe en el repositorio.")
+
+ES_INSTAGRAM = TOKEN.startswith("IG")
+BASE = f"https://graph.instagram.com/{VERSION}" if ES_INSTAGRAM else f"https://graph.facebook.com/{VERSION}"
+print("Tipo de token:", "Instagram" if ES_INSTAGRAM else "Facebook")
+HEAD = {"Authorization": f"Bearer {TOKEN}"}
+
+hoy = dt.datetime.now(ZoneInfo("America/Argentina/Buenos_Aires")).date()
+repo = os.environ["GITHUB_REPOSITORY"]
+rama = os.environ.get("GITHUB_REF_NAME", "main")
+url = f"https://raw.githubusercontent.com/{repo}/{rama}/placas/placa-{hoy.isoformat()}.jpg"
+
+
+def buscar_cuenta():
+    """Devuelve el identificador de la cuenta de Instagram a la que publicar."""
+    manual = os.environ.get("IG_USER_ID", "").strip()
+    if manual:
+        return manual
+    if ES_INSTAGRAM:
+        return "me"
+    # token de Facebook: buscar la cuenta de Instagram vinculada a la página
+    r = requests.get(f"{BASE}/me", headers=HEAD, params={"fields": "id,instagram_business_account"}, timeout=30)
+    if r.ok and r.json().get("instagram_business_account"):          # token de página
+        return r.json()["instagram_business_account"]["id"]
+    r = requests.get(f"{BASE}/me/accounts", headers=HEAD,
+                     params={"fields": "name,instagram_business_account"}, timeout=30)
+    if not r.ok:
+        fallar("No pude leer las páginas de Facebook con este token.", r)
+    for pagina in r.json().get("data", []):
+        if pagina.get("instagram_business_account"):
+            print("Página de Facebook vinculada encontrada:", pagina.get("name"))
+            return pagina["instagram_business_account"]["id"]
+    fallar("El token no ve ninguna cuenta de Instagram vinculada a una página de Facebook.", r)
+
+
+USER_ID = buscar_cuenta()
 
 # 1) esperar a que la imagen ya sea visible públicamente (Instagram la descarga desde esa URL)
 for _ in range(12):

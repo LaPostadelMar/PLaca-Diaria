@@ -39,10 +39,26 @@ rama = os.environ.get("GITHUB_REF_NAME", "main")
 url = f"https://raw.githubusercontent.com/{repo}/{rama}/placas/placa-{hoy.isoformat()}.jpg"
 
 
+def mostrar_permisos():
+    """Para diagnóstico: lista los permisos que tiene el token (no muestra datos personales)."""
+    try:
+        r = requests.get(f"{BASE}/me/permissions", headers=HEAD, timeout=30)
+        if r.ok:
+            dados = sorted(p["permission"] for p in r.json().get("data", []) if p.get("status") == "granted")
+            print("Permisos del token:", ", ".join(dados) or "(ninguno)")
+        else:
+            print("No pude leer los permisos del token:", r.status_code, r.text[:300])
+    except Exception as e:
+        print("No pude leer los permisos del token:", type(e).__name__)
+
+
 def buscar_cuenta():
     """Devuelve el identificador de la cuenta de Instagram a la que publicar."""
-    manual = os.environ.get("IG_USER_ID", "").strip()
+    manual = "".join(os.environ.get("IG_USER_ID", "").split())
+    if not ES_INSTAGRAM:
+        mostrar_permisos()
     if manual:
+        print("Uso la cuenta de Instagram indicada en el secreto IG_USER_ID.")
         return manual
     if ES_INSTAGRAM:
         return "me"
@@ -58,7 +74,8 @@ def buscar_cuenta():
         if pagina.get("instagram_business_account"):
             print("Página de Facebook vinculada encontrada:", pagina.get("name"))
             return pagina["instagram_business_account"]["id"]
-    fallar("El token no ve ninguna cuenta de Instagram vinculada a una página de Facebook.", r)
+    fallar("El token no ve ninguna página de Facebook con Instagram vinculado. "
+           "Cargá el número de la cuenta de Instagram como secreto IG_USER_ID.", r)
 
 
 USER_ID = buscar_cuenta()

@@ -36,25 +36,48 @@ def open_meteo(host, ruta, params, intentos=3):
             time.sleep(10 * (intento + 1))
 
 
-def resumen_clima(temps, vel, ang, fuente):
+def resumen_lluvia(horas, mm, prob=None):
+    """Resumen de lluvia desde las 8 hs. Devuelve None si no se espera lluvia relevante."""
+    idx = [i for i, t in enumerate(horas) if t.hour >= 8]
+    if not idx:
+        return None
+    total = sum((mm[i] or 0) for i in idx)
+    pmax = max((prob[i] or 0) for i in idx) if prob else None
+    sig = [i for i in idx if (mm[i] or 0) >= 0.1 or (prob and (prob[i] or 0) >= 60)]
+    if not sig or not (total >= 0.5 or (pmax is not None and pmax >= 60)):
+        return None
+    return {"prob": pmax, "mm": total, "desde": horas[sig[0]].hour, "hasta": horas[sig[-1]].hour + 1}
+
+
+def texto_lluvia(l):
+    partes = []
+    if l["prob"] is not None:
+        partes.append(f"{l['prob']:.0f}%")
+    partes.append(f"{l['mm']:.0f} mm" if l["mm"] >= 1 else "< 1 mm")
+    partes.append(f"{l['desde']} a {l['hasta']} hs" if l["hasta"] - l["desde"] > 1 else f"a las {l['desde']} hs")
+    return " · ".join(partes)
+
+
+def resumen_clima(temps, vel, ang, fuente, lluvia=None):
     u = sum(v * math.sin(a) for v, a in zip(vel, ang))
     w = sum(v * math.cos(a) for v, a in zip(vel, ang))
     grados = math.degrees(math.atan2(u, w)) % 360
     return {"tmax": max(temps), "tmin": min(temps), "viento_kmh": sum(vel) / len(vel),
-            "viento_dir": PUNTOS[round(grados / 45) % 8], "fuente": fuente}
+            "viento_dir": PUNTOS[round(grados / 45) % 8], "fuente": fuente, "lluvia": lluvia}
 
 
 def clima_open_meteo(hoy):
     j = open_meteo("api", "/v1/forecast", {
         "latitude": LAT, "longitude": LON, "timezone": TZ_NOMBRE,
-        "hourly": "temperature_2m,wind_speed_10m,wind_direction_10m",
+        "hourly": "temperature_2m,wind_speed_10m,wind_direction_10m,precipitation,precipitation_probability",
         "wind_speed_unit": "kmh", "start_date": hoy.isoformat(), "end_date": hoy.isoformat()})
     h = j["hourly"]
     horas = [dt.datetime.fromisoformat(t) for t in h["time"]]
     dia = [i for i, t in enumerate(horas) if 10 <= t.hour <= 19]      # horario de playa
     vel = [h["wind_speed_10m"][i] for i in dia]
     ang = [math.radians(h["wind_direction_10m"][i]) for i in dia]
-    return resumen_clima(h["temperature_2m"], vel, ang, "Open-Meteo")
+    lluvia = resumen_lluvia(horas, h["precipitation"], h["precipitation_probability"])
+    return resumen_clima(h["temperature_2m"], vel, ang, "Open-Meteo", lluvia)
 
 
 def clima_metno(hoy):
@@ -64,19 +87,23 @@ def clima_metno(hoy):
                      headers={"User-Agent": "LaPostaDelMar-placa-diaria/1.0 github.com/LaPostadelMar/PLaca-Diaria"},
                      timeout=(10, 30))
     r.raise_for_status()
-    temps, vel, ang = [], [], []
+    temps, vel, ang, horas_ll, mm_ll = [], [], [], [], []
     for e in r.json()["properties"]["timeseries"]:
         t = dt.datetime.fromisoformat(e["time"].replace("Z", "+00:00")).astimezone(TZ)
         if t.date() != hoy:
             continue
         det = e["data"]["instant"]["details"]
         temps.append(det["air_temperature"])
+        sig_h = (e["data"].get("next_1_hours") or {}).get("details", {})
+        if "precipitation_amount" in sig_h:
+            horas_ll.append(t.replace(tzinfo=None))
+            mm_ll.append(sig_h["precipitation_amount"])
         if 10 <= t.hour <= 19:
             vel.append(det["wind_speed"] * 3.6)                          # m/s -> km/h
             ang.append(math.radians(det["wind_from_direction"]))
     if not temps or not vel:
         raise RuntimeError("MET Norway no devolvió datos para hoy")
-    return resumen_clima(temps, vel, ang, "MET Norway")
+    return resumen_clima(temps, vel, ang, "MET Norway", resumen_lluvia(horas_ll, mm_ll))
 
 
 def clima(hoy):
@@ -157,24 +184,33 @@ def font(peso, tam):
 
 
 def dibujar(datos, salida):
+    ll = datos.get("lluvia")
+    if ll:      # con aviso de lluvia el diseño se compacta un poco
+        logo_tam, logo_y, t1_y, t2_y = 400, 215, 640, 684
+        x0, cw, ch, gap, y0, ch_ll = 80, 920, 164, 16, 770, 124
+    else:
+        logo_tam, logo_y, t1_y, t2_y = 430, 225, 664, 708
+        x0, cw, ch, gap, y0, ch_ll = 80, 920, 190, 20, 800, 0
+    k = ch / 190
+
     stops = [(0.0, (11, 60, 93)), (0.55, (31, 122, 140)), (1.0, (242, 166, 90))]
     ys = np.linspace(0, 1, H)[:, None]
     arr = np.zeros((H, 1, 3))
     for (p0, c0), (p1, c1) in zip(stops, stops[1:]):
         m = (ys >= p0) & (ys <= p1)
         t = (ys - p0) / (p1 - p0)
-        for k in range(3):
-            arr[:, :, k] = np.where(m, c0[k] + (c1[k] - c0[k]) * t, arr[:, :, k])
+        for c in range(3):
+            arr[:, :, c] = np.where(m, c0[c] + (c1[c] - c0[c]) * t, arr[:, :, c])
     bg = Image.fromarray(np.repeat(arr, W, axis=1).astype("uint8")).convert("RGBA")
 
     logo = Image.open(buscar("logo", ".png")).convert("RGBA")
     a = np.array(logo).astype(float)
     mask = ((255 - a[..., :3].mean(axis=2)) / 255 * a[..., 3]).clip(0, 255).astype("uint8")
-    blanco = Image.new("RGBA", logo.size, (255, 255, 255, 255))
-    blanco.putalpha(Image.fromarray(mask))
-    ls = 430 * S
-    blanco = blanco.resize((ls, ls), Image.LANCZOS)
-    bg.alpha_composite(blanco, ((W - ls) // 2, 225 * S))
+    blanco_img = Image.new("RGBA", logo.size, (255, 255, 255, 255))
+    blanco_img.putalpha(Image.fromarray(mask))
+    ls = logo_tam * S
+    blanco_img = blanco_img.resize((ls, ls), Image.LANCZOS)
+    bg.alpha_composite(blanco_img, ((W - ls) // 2, logo_y * S))
 
     d = ImageDraw.Draw(bg)
 
@@ -188,15 +224,25 @@ def dibujar(datos, salida):
         else:
             d.text(((W - d.textlength(txt, font=f)) / 2, y * S), txt, font=f, fill=fill)
 
-    centrado("EL TIEMPO HOY", 664, font("Medium", 30), (255, 255, 255, 220), esp=8)
-    centrado(datos["fecha"], 708, font("Bold", 56))
+    centrado("EL TIEMPO HOY", t1_y, font("Medium", 30), (255, 255, 255, 220), esp=8)
+    centrado(datos["fecha"], t2_y, font("Bold", 56))
 
-    x0, cw, ch, gap, y0 = 80, 920, 190, 20, 800
+    etiqueta_marea = "MAREAS (ESTIMADAS)" if MAREAS_ESTIMADAS else "MAREAS"
+    tarjetas = [("temp", "TEMPERATURA", ch)]
+    if ll:
+        tarjetas.append(("lluvia", "LLUVIA PREVISTA", ch_ll))
+    tarjetas += [("viento", "VIENTO", ch), ("marea", etiqueta_marea, ch), ("sol", "PUESTA DEL SOL", ch)]
+
+    posiciones, y = [], y0
+    for tipo, etiqueta, alto in tarjetas:
+        posiciones.append(y)
+        y += alto + gap
+    y_fin = y - gap
+
     ov = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     od = ImageDraw.Draw(ov)
-    for i in range(4):
-        y = y0 + i * (ch + gap)
-        od.rounded_rectangle([x0 * S, y * S, (x0 + cw) * S, (y + ch) * S], radius=44 * S, fill=(8, 34, 58, 120))
+    for (tipo, etiqueta, alto), y in zip(tarjetas, posiciones):
+        od.rounded_rectangle([x0 * S, y * S, (x0 + cw) * S, (y + alto) * S], radius=44 * S, fill=(8, 34, 58, 120))
     bg.alpha_composite(ov)
     d = ImageDraw.Draw(bg)
     blanco = (255, 255, 255)
@@ -206,53 +252,63 @@ def dibujar(datos, salida):
             tam -= 2
         return font(peso, tam)
 
-    def icono(tipo, cx, cy):
-        cx *= S; cy *= S; lw = 6 * S
+    def icono(tipo, cx, cy, esc=1.0):
+        cx *= S; cy *= S; lw = int(6 * S * esc)
+        e = esc
         if tipo == "temp":
-            d.rounded_rectangle([cx - 9 * S, cy - 46 * S, cx + 9 * S, cy + 20 * S], radius=9 * S, outline=blanco, width=lw)
-            d.ellipse([cx - 22 * S, cy + 6 * S, cx + 22 * S, cy + 50 * S], fill=blanco)
-            d.rectangle([cx - 4 * S, cy - 10 * S, cx + 4 * S, cy + 30 * S], fill=blanco)
+            d.rounded_rectangle([cx - 9 * S * e, cy - 46 * S * e, cx + 9 * S * e, cy + 20 * S * e], radius=9 * S * e, outline=blanco, width=lw)
+            d.ellipse([cx - 22 * S * e, cy + 6 * S * e, cx + 22 * S * e, cy + 50 * S * e], fill=blanco)
+            d.rectangle([cx - 4 * S * e, cy - 10 * S * e, cx + 4 * S * e, cy + 30 * S * e], fill=blanco)
         elif tipo == "viento":
-            r = 13 * S
-            for k, (dy, ex) in enumerate([(-26, 25), (0, 40), (26, 10)]):
-                y = cy + dy * S; e = cx + ex * S
-                d.line([cx - 50 * S, y, e, y], fill=blanco, width=lw)
-                if k < 2:
-                    d.arc([e - r, y - 2 * r, e + r, y], -180, 90, fill=blanco, width=lw)
+            r = 13 * S * e
+            for n, (dy, ex) in enumerate([(-26, 25), (0, 40), (26, 10)]):
+                yy = cy + dy * S * e; xe = cx + ex * S * e
+                d.line([cx - 50 * S * e, yy, xe, yy], fill=blanco, width=lw)
+                if n < 2:
+                    d.arc([xe - r, yy - 2 * r, xe + r, yy], -180, 90, fill=blanco, width=lw)
                 else:
-                    d.arc([e - r, y, e + r, y + 2 * r], -90, 180, fill=blanco, width=lw)
+                    d.arc([xe - r, yy, xe + r, yy + 2 * r], -90, 180, fill=blanco, width=lw)
         elif tipo == "marea":
             for dy in (-14, 18):
-                pts = [(cx - 48 * S + t * S, cy + dy * S + math.sin(t / 96 * 2 * math.pi * 1.5) * 10 * S) for t in range(0, 97)]
+                pts = [(cx - 48 * S * e + t * S * e, cy + dy * S * e + math.sin(t / 96 * 2 * math.pi * 1.5) * 10 * S * e) for t in range(0, 97)]
                 d.line(pts, fill=blanco, width=lw, joint="curve")
         elif tipo == "sol":
-            d.arc([cx - 30 * S, cy - 24 * S, cx + 30 * S, cy + 36 * S], 180, 360, fill=blanco, width=lw)
-            d.line([cx - 52 * S, cy + 6 * S, cx + 52 * S, cy + 6 * S], fill=blanco, width=lw)
-            d.line([cx - 30 * S, cy + 30 * S, cx + 30 * S, cy + 30 * S], fill=blanco, width=lw)
+            d.arc([cx - 30 * S * e, cy - 24 * S * e, cx + 30 * S * e, cy + 36 * S * e], 180, 360, fill=blanco, width=lw)
+            d.line([cx - 52 * S * e, cy + 6 * S * e, cx + 52 * S * e, cy + 6 * S * e], fill=blanco, width=lw)
+            d.line([cx - 30 * S * e, cy + 30 * S * e, cx + 30 * S * e, cy + 30 * S * e], fill=blanco, width=lw)
             for ang in (-90, -45, -135):
                 c, s_ = math.cos(math.radians(ang)), math.sin(math.radians(ang))
-                d.line([cx + c * 42 * S, cy + 6 * S + s_ * 42 * S, cx + c * 58 * S, cy + 6 * S + s_ * 58 * S], fill=blanco, width=lw)
+                d.line([cx + c * 42 * S * e, cy + 6 * S * e + s_ * 42 * S * e, cx + c * 58 * S * e, cy + 6 * S * e + s_ * 58 * S * e], fill=blanco, width=lw)
+        elif tipo == "lluvia":
+            for ox, oy, rr in ((-24, 0, 17), (0, -12, 23), (24, 2, 16)):
+                d.ellipse([cx + (ox - rr) * S * e, cy + (oy - rr - 6) * S * e, cx + (ox + rr) * S * e, cy + (oy + rr - 6) * S * e], fill=blanco)
+            d.rectangle([cx - 24 * S * e, cy - 12 * S * e, cx + 24 * S * e, cy + 10 * S * e], fill=blanco)
+            for ox in (-20, 0, 20):
+                d.line([cx + ox * S * e, cy + 20 * S * e, cx + (ox - 7) * S * e, cy + 38 * S * e], fill=blanco, width=lw)
 
-    etiqueta_marea = "MAREAS (ESTIMADAS)" if MAREAS_ESTIMADAS else "MAREAS"
-    tarjetas = [("temp", "TEMPERATURA"), ("viento", "VIENTO"), ("marea", etiqueta_marea), ("sol", "PUESTA DEL SOL")]
-    for i, (tipo, etiqueta) in enumerate(tarjetas):
-        y = y0 + i * (ch + gap)
-        icono(tipo, x0 + 95, y + ch / 2)
+    for (tipo, etiqueta, alto), y in zip(tarjetas, posiciones):
         tx = (x0 + 190) * S
-        d.text((tx, (y + 26) * S), etiqueta, font=font("Medium", 28), fill=(255, 255, 255, 215))
+        if tipo == "lluvia":
+            icono(tipo, x0 + 95, y + alto / 2 + 2, 0.9)
+            d.text((tx, (y + 14) * S), etiqueta, font=font("Medium", 25), fill=(255, 255, 255, 215))
+            txt = texto_lluvia(ll)
+            d.text((tx, (y + 54) * S), txt, font=ajustada(txt, "Bold", 42), fill=blanco)
+            continue
+        icono(tipo, x0 + 95, y + alto / 2, 0.9 if k < 1 else 1.0)
+        d.text((tx, (y + 26 * k) * S), etiqueta, font=font("Medium", 28 * k), fill=(255, 255, 255, 215))
         if tipo == "marea":
             m = datos["mareas"]
             if m:
                 for dy, txt in ((66, "Pleamar  " + m["pleamar"]), (120, "Bajamar  " + m["bajamar"])):
-                    d.text((tx, (y + dy) * S), txt, font=ajustada(txt, "Bold", 42), fill=blanco)
+                    d.text((tx, (y + dy * k) * S), txt, font=ajustada(txt, "Bold", 42 * k), fill=blanco)
             else:
-                d.text((tx, (y + 78) * S), "No disponible hoy", font=font("Bold", 46), fill=blanco)
+                d.text((tx, (y + 78 * k) * S), "No disponible hoy", font=font("Bold", 46 * k), fill=blanco)
         else:
             txt = datos[tipo]
-            d.text((tx, (y + 68) * S), txt, font=ajustada(txt, "Bold", 70), fill=blanco)
+            d.text((tx, (y + 68 * k) * S), txt, font=ajustada(txt, "Bold", 70 * k), fill=blanco)
 
     if datos.get("fuentes"):
-        centrado("Datos: " + " · ".join(datos["fuentes"]), 1636, font("Medium", 22), (255, 255, 255, 170))
+        centrado("Datos: " + " · ".join(datos["fuentes"]), y_fin + 16, font("Medium", 22), (255, 255, 255, 170))
 
     bg.convert("RGB").resize((W // S, H // S), Image.LANCZOS).save(salida, "JPEG", quality=95)
 
@@ -265,12 +321,14 @@ def fecha_texto(f):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--demo", action="store_true", help="usa datos de ejemplo, sin internet")
+    ap.add_argument("--demo-lluvia", action="store_true", help="como --demo pero con aviso de lluvia")
     ap.add_argument("--fecha", help="AAAA-MM-DD (por defecto, hoy en Argentina)")
     args = ap.parse_args()
     hoy = dt.date.fromisoformat(args.fecha) if args.fecha else dt.datetime.now(TZ).date()
 
-    if args.demo:
-        c = {"tmax": 27.2, "tmin": 17.4, "viento_kmh": 18.3, "viento_dir": "SO", "fuente": "Open-Meteo"}
+    if args.demo or args.demo_lluvia:
+        c = {"tmax": 27.2, "tmin": 17.4, "viento_kmh": 18.3, "viento_dir": "SO", "fuente": "Open-Meteo",
+             "lluvia": {"prob": 70, "mm": 4.2, "desde": 15, "hasta": 19} if args.demo_lluvia else None}
         m = {"pleamar": "04:12 · 16:35", "bajamar": "10:20 · 22:41"}
         salida = os.path.join(AQUI, "placa-demo.jpg")
     else:
@@ -296,6 +354,7 @@ def main():
         "temp": f"máx {c['tmax']:.0f}° · mín {c['tmin']:.0f}°",
         "viento": f"{c['viento_dir']} {c['viento_kmh']:.0f} km/h",
         "mareas": m,
+        "lluvia": c.get("lluvia"),
         "sol": puesta_de_sol(hoy).strftime("%H:%M") + " hs",
         "fuentes": sorted({c["fuente"]} | ({"Open-Meteo"} if m else set())),
     }
